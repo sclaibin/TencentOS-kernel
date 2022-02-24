@@ -10,6 +10,7 @@
 #include <linux/stacktrace.h>
 #include <asm/irq_regs.h>
 #include "../sched/sched.h"
+#include <linux/cgroup.h>
 #include <linux/sli.h>
 #include <linux/rculist.h>
 
@@ -35,9 +36,61 @@ static void sli_event_monitor_init(struct sli_event_monitor *event_monitor, stru
 	event_monitor->cgrp = cgrp;
 }
 
-static inline struct sli_event_monitor *get_sli_event_monitor(struct cgroup *cgrp)
+/* Inherit the monitoring event from parent cgroup or global sli_event_monitor */
+static int sli_event_inherit(struct cgroup *cgrp)
 {
-	return &default_sli_event_monitor;
+	struct sli_event *event;
+	struct sli_event_monitor *event_monitor = &default_sli_event_monitor;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(event, &event_monitor->event_head, event_node) {
+		struct sli_event *new_event;
+
+		new_event = kmalloc(sizeof(struct sli_event), GFP_ATOMIC);
+		if (!new_event)
+			goto failed;
+
+		new_event->event_type = event->event_type;
+		new_event->event_id = event->event_id;
+
+		switch (event->event_type) {
+		case SLI_SCHED_EVENT:
+			cgrp->cgrp_event_monitor->schedlat_threshold[event->event_id] =
+					event_monitor->schedlat_threshold[event->event_id];
+			break;
+		case SLI_MEM_EVENT:
+			cgrp->cgrp_event_monitor->memlat_threshold[event->event_id] =
+					event_monitor->memlat_threshold[event->event_id];
+			break;
+		case SLI_LONGTERM_EVENT:
+			cgrp->cgrp_event_monitor->longterm_threshold[event->event_id] =
+					event_monitor->longterm_threshold[event->event_id];
+			break;
+		default:
+			printk(KERN_ERR "%s: invalid sli_event type!\n", __func__);
+			goto failed;
+
+		}
+
+		list_add(&new_event->event_node, &cgrp->cgrp_event_monitor->event_head);
+	}
+	rcu_read_unlock();
+
+	cgrp->cgrp_event_monitor->period = event_monitor->period;
+	cgrp->cgrp_event_monitor->mbuf_enable = event_monitor->mbuf_enable;
+
+	return 0;
+
+failed:
+	rcu_read_unlock();
+
+	/* Free memory from the event list */
+	list_for_each_entry(event, &cgrp->cgrp_event_monitor->event_head, event_node) {
+		list_del(&event->event_node);
+		kfree(event);
+	}
+
+	return -1;
 }
 
 static void store_task_stack(struct task_struct *task, char *reason,
@@ -261,9 +314,8 @@ void sli_memlat_stat_end(enum sli_memlat_stat_item sidx, u64 start)
 		this_cpu_add(cgrp->sli_memlat_stat_percpu->latency_max[sidx], duration);
 
 		if (static_branch_unlikely(&sli_monitor_enabled)) {
-			struct sli_event_monitor *event_monitor;
+			struct sli_event_monitor *event_monitor = cgrp->cgrp_event_monitor;
 
-			event_monitor = get_sli_event_monitor(cgrp);
 			if (duration < event_monitor->memlat_threshold[sidx])
 				goto out;
 
@@ -297,9 +349,8 @@ void sli_schedlat_stat(struct task_struct *task, enum sli_schedlat_stat_item sid
 		this_cpu_add(cgrp->sli_schedlat_stat_percpu->latency_max[sidx], delta);
 
 		if (static_branch_unlikely(&sli_monitor_enabled)) {
-			struct sli_event_monitor *event_monitor;
+			struct sli_event_monitor *event_monitor = cgrp->cgrp_event_monitor;
 
-			event_monitor = get_sli_event_monitor(cgrp);
 			if (delta < event_monitor->schedlat_threshold[sidx])
 				goto out;
 
@@ -334,9 +385,8 @@ void sli_schedlat_rundelay(struct task_struct *task, struct task_struct *prev, u
 		this_cpu_add(cgrp->sli_schedlat_stat_percpu->latency_max[sidx], delta);
 
 		if (static_branch_unlikely(&sli_monitor_enabled)) {
-			struct sli_event_monitor *event_monitor;
+			struct sli_event_monitor *event_monitor = cgrp->cgrp_event_monitor;
 
-			event_monitor = get_sli_event_monitor(cgrp);
 			if (delta < event_monitor->schedlat_threshold[sidx])
 				goto out;
 
@@ -526,32 +576,58 @@ static const struct file_operations sli_enabled_fops = {
 
 int sli_cgroup_alloc(struct cgroup *cgroup)
 {
-	if (!cgroup)
+	if (!cgroup_need_sli(cgroup))
 		return 0;
 
 	spin_lock_init(&cgroup->cgrp_mbuf_lock);
 	cgroup->sli_memlat_stat_percpu = alloc_percpu(struct sli_memlat_stat);
 	if (!cgroup->sli_memlat_stat_percpu)
-		return -ENOMEM;
+		goto out;
 
 	cgroup->sli_schedlat_stat_percpu = alloc_percpu(struct sli_schedlat_stat);
-	if (!cgroup->sli_schedlat_stat_percpu) {
-		free_percpu(cgroup->sli_memlat_stat_percpu);
-		return -ENOMEM;
-	}
+	if (!cgroup->sli_schedlat_stat_percpu)
+		goto free_memlat_percpu;
+
+	cgroup->cgrp_event_monitor = kzalloc(sizeof(struct sli_event_monitor), GFP_KERNEL);
+	if (!cgroup->cgrp_event_monitor)
+		goto free_schelat_percpu;
+
+	sli_event_monitor_init(cgroup->cgrp_event_monitor, cgroup);
+	if (sli_event_inherit(cgroup))
+		goto free_cgrp_event;
 
 	return 0;
+
+free_cgrp_event:
+	kfree(cgroup->cgrp_event_monitor);
+free_schelat_percpu:
+	free_percpu(cgroup->sli_schedlat_stat_percpu);
+free_memlat_percpu:
+	free_percpu(cgroup->sli_memlat_stat_percpu);
+out:
+	return -ENOMEM;
 }
 
 void sli_cgroup_free(struct cgroup *cgroup)
 {
-	if (!cgroup)
+	struct sli_event *event;
+
+	/*
+	 * Cgroup's subsys would be cleared before sli_cgroup_free() had been called.
+	 * So we use !cgroup->cgrp_event_monitor instead of cgroup_need_sli to check
+	 * whether the cgroup'smemory should be freed here.
+	 */
+	if (!cgroup->cgrp_event_monitor)
 		return;
 
-	if (cgroup->sli_memlat_stat_percpu)
-		free_percpu(cgroup->sli_memlat_stat_percpu);
-	if (cgroup->sli_schedlat_stat_percpu)
-		free_percpu(cgroup->sli_schedlat_stat_percpu);
+	free_percpu(cgroup->sli_memlat_stat_percpu);
+	free_percpu(cgroup->sli_schedlat_stat_percpu);
+	/* Free memory from the event list */
+	list_for_each_entry(event, &cgroup->cgrp_event_monitor->event_head, event_node) {
+		list_del(&event->event_node);
+		kfree(event);
+	}
+	kfree(cgroup->cgrp_event_monitor);
 }
 
 static int __init sli_proc_init(void)
