@@ -22,6 +22,66 @@ static DEFINE_STATIC_KEY_FALSE(sli_monitor_enabled);
 static struct sli_event_monitor default_sli_event_monitor;
 static struct workqueue_struct *sli_workqueue;
 
+struct sli_event_control {
+	int event_type;
+	int event_id;
+	int period;
+	int mbuf_enable;
+	unsigned long long count;
+	unsigned long long threshold;
+};
+
+static const char *schedlat_theshold_name[] = {
+	"schedlat_wait_threshold=",
+	"schedlat_block_threshold=",
+	"schedlat_ioblock_threshold=",
+	"schedlat_sleep_threshold=",
+	"schedlat_longsys_threshold=",
+	"schedlat_rundelay_threshold=",
+	"schedlat_irqtime_threshold="
+};
+
+static const char *memlat_threshold_name[] = {
+	"memlat_global_direct_reclaim_threshold=",
+	"memlat_memcg_direct_reclaim_threshold=",
+	"memlat_direct_compact_threshold=",
+	"memlat_global_direct_swapout_threshold=",
+	"memlat_memcg_direct_swapout_threshold=",
+	"memlat_direct_swapin_threshold=",
+	"memlat_page_alloc_threshold="
+};
+
+static const char *longterm_threshold_name[] = {
+	"longterm_rundelay_threshold=",
+	"longterm_irqtime_threshold="
+};
+
+static const char *sanity_check_abbr[] = {
+	"schedlat_",
+	"memlat_",
+	"longterm_",
+	"period=",
+	"mbuf_enable="
+};
+
+static unsigned long sli_get_longterm_statistics(struct cgroup *cgrp,
+						 enum sli_longterm_event event_id);
+
+/*
+ * Convert the ULLONG_MAX to zero when show them to userspace, and convert the zero to
+ * ULLONG_MAX when write value to control interface.
+ */
+static inline u64 sli_convert_value(u64 value, bool control_show)
+{
+	if (control_show && value == ULLONG_MAX)
+		return 0;
+
+	if (!control_show && value == 0)
+		value = ULLONG_MAX;
+
+	return value;
+}
+
 static void sli_event_monitor_init(struct sli_event_monitor *event_monitor, struct cgroup *cgrp)
 {
 	INIT_LIST_HEAD_RCU(&event_monitor->event_head);
@@ -39,8 +99,9 @@ static void sli_event_monitor_init(struct sli_event_monitor *event_monitor, stru
 /* Inherit the monitoring event from parent cgroup or global sli_event_monitor */
 static int sli_event_inherit(struct cgroup *cgrp)
 {
-	struct sli_event *event;
+	struct sli_event *event, *event_tmp;
 	struct sli_event_monitor *event_monitor = &default_sli_event_monitor;
+	struct sli_event_monitor *cgrp_event_monitor = cgrp->cgrp_event_monitor;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(event, &event_monitor->event_head, event_node) {
@@ -55,16 +116,22 @@ static int sli_event_inherit(struct cgroup *cgrp)
 
 		switch (event->event_type) {
 		case SLI_SCHED_EVENT:
-			cgrp->cgrp_event_monitor->schedlat_threshold[event->event_id] =
+			cgrp_event_monitor->schedlat_threshold[event->event_id] =
 					event_monitor->schedlat_threshold[event->event_id];
+			cgrp_event_monitor->schedlat_count[event->event_id] =
+					event_monitor->schedlat_count[event->event_id];
 			break;
 		case SLI_MEM_EVENT:
-			cgrp->cgrp_event_monitor->memlat_threshold[event->event_id] =
+			cgrp_event_monitor->memlat_threshold[event->event_id] =
 					event_monitor->memlat_threshold[event->event_id];
+			cgrp_event_monitor->memlat_count[event->event_id] =
+					event_monitor->memlat_count[event->event_id];
 			break;
 		case SLI_LONGTERM_EVENT:
-			cgrp->cgrp_event_monitor->longterm_threshold[event->event_id] =
+			cgrp_event_monitor->longterm_threshold[event->event_id] =
 					event_monitor->longterm_threshold[event->event_id];
+			atomic_long_set(&cgrp_event_monitor->longterm_statistics[event->event_id],
+					sli_get_longterm_statistics(cgrp, event->event_id));
 			break;
 		default:
 			printk(KERN_ERR "%s: invalid sli_event type!\n", __func__);
@@ -72,7 +139,7 @@ static int sli_event_inherit(struct cgroup *cgrp)
 
 		}
 
-		list_add(&new_event->event_node, &cgrp->cgrp_event_monitor->event_head);
+		list_add(&new_event->event_node, &cgrp_event_monitor->event_head);
 	}
 	rcu_read_unlock();
 
@@ -85,7 +152,8 @@ failed:
 	rcu_read_unlock();
 
 	/* Free memory from the event list */
-	list_for_each_entry(event, &cgrp->cgrp_event_monitor->event_head, event_node) {
+	list_for_each_entry_safe(event, event_tmp,
+				 &cgrp->cgrp_event_monitor->event_head, event_node) {
 		list_del(&event->event_node);
 		kfree(event);
 	}
@@ -207,6 +275,24 @@ static char * get_schedlat_name(enum sli_memlat_stat_item sidx)
 		break;
 	case SCHEDLAT_IRQTIME:
 		name = "schedlat_irqtime";
+		break;
+	default:
+		break;
+	}
+
+	return name;
+}
+
+static char *get_longterm_name(enum sli_longterm_event sidx)
+{
+	char *name = NULL;
+
+	switch (sidx) {
+	case SLI_LONGTERM_RUNDELAY:
+		name = "longterm_rundelay";
+		break;
+	case SLI_LONGTERM_IRQTIME:
+		name = "longterm_irqtime";
 		break;
 	default:
 		break;
@@ -522,6 +608,341 @@ int sli_schedlat_stat_show(struct seq_file *m, struct cgroup *cgrp)
 	return 0;
 }
 
+static unsigned long sli_get_longterm_statistics(struct cgroup *cgrp,
+						 enum sli_longterm_event event_id)
+{
+	int cpu, index;
+	unsigned long latency_sum = 0;
+
+	index = SCHEDLAT_RUNDELAY + event_id;
+	for_each_possible_cpu(cpu)
+		latency_sum += per_cpu_ptr(cgrp->sli_schedlat_stat_percpu, cpu)->latency_max[index];
+
+	return latency_sum;
+}
+
+static inline int sli_parse_threshold(char *buf, struct sli_event_control *sec)
+{
+	char *str;
+	int i, len, ret;
+	u64 value;
+
+	/* Replace the delimiter with '\0' */
+	len = strlen(buf);
+	for (i = 0; i < len; i++) {
+		if (buf[i] == ',' || buf[i] == ' ') {
+			buf[i] = '\0';
+			break;
+		}
+	}
+
+	if (i == len)
+		return -EINVAL;
+
+	/* Parse the value for theshold */
+	ret = kstrtou64(buf, 0, &value);
+	if (ret)
+		return ret;
+
+	sec->threshold = sli_convert_value(value, false);
+
+	/* Move the pointer to the positon which after the delimiter */
+	buf += (i + 1);
+	len -= (i + 1);
+
+	/* Parse the value for count(if it exist) */
+	str = strnstr(buf, "count=", len);
+	if (!str)
+		return -EINVAL;
+
+	str += strlen("count=");
+	ret = kstrtou64(str, 0, &value);
+	if (ret)
+		return ret;
+
+	sec->count = sli_convert_value(value, false);
+
+	return 0;
+}
+
+static int sli_parse_parameter(char *buf, int len, struct sli_event_control *sec, int index)
+{
+	int i, min_len, ret = 0;
+	u64 value;
+
+	switch (index) {
+	case 0:
+		for (i = 0; i < ARRAY_SIZE(schedlat_theshold_name); i++) {
+			min_len = min(len, (int)strlen(schedlat_theshold_name[i]));
+			if (!strncmp(schedlat_theshold_name[i], buf, min_len))
+				break;
+		}
+
+		if (i == ARRAY_SIZE(schedlat_theshold_name))
+			return -EINVAL;
+
+		buf += min_len;
+		ret = sli_parse_threshold(buf, sec);
+		if (ret)
+			return ret;
+
+		sec->event_type = SLI_SCHED_EVENT;
+		sec->event_id = i;
+		break;
+	case 1:
+		for (i = 0; i < ARRAY_SIZE(memlat_threshold_name); i++) {
+			min_len = min(len, (int)strlen((const char *)memlat_threshold_name[i]));
+			if (!strncmp(memlat_threshold_name[i], buf, min_len))
+				break;
+		}
+
+		if (i == ARRAY_SIZE(memlat_threshold_name))
+			return -EINVAL;
+
+		buf += min_len;
+		ret = sli_parse_threshold(buf, sec);
+		if (ret)
+			return ret;
+
+		sec->event_type = SLI_MEM_EVENT;
+		sec->event_id = i;
+		break;
+	case 2:
+		for (i = 0; i < ARRAY_SIZE(longterm_threshold_name); i++) {
+			min_len = min(len, (int)strlen((const char *)longterm_threshold_name[i]));
+			if (!strncmp(longterm_threshold_name[i], buf, min_len))
+				break;
+		}
+
+		if (i == ARRAY_SIZE(longterm_threshold_name))
+			return -EINVAL;
+
+		buf += min_len;
+		ret = sli_parse_threshold(buf, sec);
+		if (ret)
+			return ret;
+
+		sec->event_type = SLI_LONGTERM_EVENT;
+		sec->event_id = i;
+		break;
+	case 3:
+		buf += strlen("period=");
+		ret = kstrtou64(buf, 0, &value);
+		if (ret)
+			return ret;
+
+		sec->period = usecs_to_jiffies(value);
+		break;
+	case 4:
+		buf += strlen("mbuf_enable=");
+		ret = kstrtou64(buf, 0, &value);
+		if (ret)
+			return ret;
+
+		sec->mbuf_enable = !!value;
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int sli_sanity_check(char *buf, struct sli_event_control *sec)
+{
+	int i, len, min_len;
+
+	buf = strstrip(buf);
+	if (!buf)
+		return -EINVAL;
+
+	len = strlen(buf);
+	for (i = 0; i < ARRAY_SIZE(sanity_check_abbr); i++) {
+		min_len = min(len, (int)strlen(sanity_check_abbr[i]));
+
+		if (!strncmp(sanity_check_abbr[i], buf, min_len))
+			break;
+	}
+
+	/* The input string is not match with entries in the list */
+	if (i == ARRAY_SIZE(sanity_check_abbr))
+		return -EINVAL;
+
+	return sli_parse_parameter(buf, len, sec, i);
+}
+
+static int sli_event_update(struct sli_event_monitor *event_monitor,
+			    struct sli_event_control *sec, u64 last_threshold)
+{
+	struct sli_event *event;
+
+	/* Add the sli event */
+	if (last_threshold == ULLONG_MAX && sec->threshold != ULLONG_MAX) {
+		event = kmalloc(sizeof(struct sli_event), GFP_KERNEL);
+		if (!event)
+			return -ENOMEM;
+
+		event->event_type = sec->event_type;
+		event->event_id = sec->event_id;
+		/* event_type and event_id assignment should be done before add entry to list */
+		smp_wmb();
+		list_add_rcu(&event->event_node, &event_monitor->event_head);
+	} else if (last_threshold != ULLONG_MAX && sec->threshold == ULLONG_MAX) {
+		list_for_each_entry(event, &event_monitor->event_head, event_node) {
+			if (event->event_type != sec->event_type)
+				continue;
+
+			if (event->event_id != sec->event_id)
+				continue;
+
+			list_del_rcu(&event->event_node);
+			kfree_rcu(event, rcu);
+			break;
+		}
+	}
+
+	return 0;
+}
+
+ssize_t cgroup_sli_control_write(struct kernfs_open_file *of, char *buf,
+				 size_t nbytes, loff_t off)
+{
+	int ret;
+	struct cgroup *cgrp;
+	struct sli_event_monitor *event_monitor;
+	struct sli_event_control sec = {.event_type = -1, .period = -1, .mbuf_enable = -1,};
+
+	cgrp = of_css(of)->cgroup;
+	if (cgroup_parent(cgrp))
+		event_monitor = cgrp->cgrp_event_monitor;
+	else
+		event_monitor = &default_sli_event_monitor;
+
+	inode_lock(file_inode(of->file));
+	ret = sli_sanity_check(buf, &sec);
+	if (ret)
+		goto out;
+
+	if (sec.period != -1) {
+		if (!!event_monitor->period == !!sec.period) {
+			event_monitor->period = sec.period;
+			goto out;
+		}
+
+		event_monitor->period = sec.period;
+
+		if (cgroup_parent(cgrp) || event_monitor->mbuf_enable)
+			goto out;
+
+		if (sec.period)
+			static_branch_enable(&sli_monitor_enabled);
+		else
+			static_branch_disable(&sli_monitor_enabled);
+
+		goto out;
+	}
+
+	if (sec.mbuf_enable != -1) {
+		if (sec.mbuf_enable == event_monitor->mbuf_enable)
+			goto out;
+
+		event_monitor->mbuf_enable = sec.mbuf_enable;
+
+		if (cgroup_parent(cgrp) || event_monitor->period)
+			goto out;
+
+		if (sec.mbuf_enable)
+			static_branch_enable(&sli_monitor_enabled);
+		else
+			static_branch_disable(&sli_monitor_enabled);
+
+		goto out;
+	}
+
+	if (sec.event_type != -1) {
+		unsigned long long last_threshold;
+
+		switch (sec.event_type) {
+		case SLI_SCHED_EVENT:
+			last_threshold = event_monitor->schedlat_threshold[sec.event_id];
+			event_monitor->schedlat_threshold[sec.event_id] = sec.threshold;
+			event_monitor->schedlat_count[sec.event_id] = sec.count;
+			smp_wmb();
+			atomic_long_set(&event_monitor->schedlat_statistics[sec.event_id], 0);
+			ret = sli_event_update(event_monitor, &sec, last_threshold);
+			break;
+		case SLI_MEM_EVENT:
+			last_threshold = event_monitor->memlat_threshold[sec.event_id];
+			event_monitor->memlat_threshold[sec.event_id] = sec.threshold;
+			event_monitor->memlat_count[sec.event_id] = sec.count;
+			smp_wmb();
+			atomic_long_set(&event_monitor->memlat_statistics[sec.event_id], 0);
+			ret = sli_event_update(event_monitor, &sec, last_threshold);
+			break;
+		case SLI_LONGTERM_EVENT:
+			last_threshold = event_monitor->longterm_threshold[sec.event_id];
+			event_monitor->longterm_threshold[sec.event_id] = sec.threshold;
+			smp_wmb();
+			if (cgroup_parent(cgrp))
+				atomic_long_set(&event_monitor->longterm_statistics[sec.event_id],
+						sli_get_longterm_statistics(cgrp, sec.event_id));
+			ret = sli_event_update(event_monitor, &sec, last_threshold);
+			break;
+		default:
+			break;
+		}
+
+	}
+
+out:
+	if (!ret)
+		ret = nbytes;
+	inode_unlock(file_inode(of->file));
+	return ret;
+}
+
+int cgroup_sli_control_show(struct seq_file *sf, void *v)
+{
+	int i;
+	unsigned long long threshold, count;
+	struct cgroup *cgrp;
+	struct sli_event_monitor *event_monitor;
+
+	cgrp = seq_css(sf)->cgroup;
+	if (cgroup_parent(cgrp))
+		event_monitor = cgrp->cgrp_event_monitor;
+	else
+		event_monitor = &default_sli_event_monitor;
+
+	seq_printf(sf, "period: %d\n", event_monitor->period);
+	seq_printf(sf, "mbuf_enable: %d\n", event_monitor->mbuf_enable);
+
+	for (i = 0; i < SCHEDLAT_STAT_NR; i++) {
+		threshold = sli_convert_value(event_monitor->schedlat_threshold[i], true);
+		count = sli_convert_value(event_monitor->schedlat_count[i], true);
+
+		seq_printf(sf, "%s: threshold: %llu, count: %llu\n", get_schedlat_name(i),
+			   threshold, count);
+	}
+
+	for (i = 0; i < MEM_LAT_STAT_NR; i++) {
+		threshold = sli_convert_value(event_monitor->memlat_threshold[i], true);
+		count = sli_convert_value(event_monitor->memlat_count[i], true);
+
+		seq_printf(sf, "%s: threshold: %llu, count: %llu\n", get_memlat_name(i),
+			   threshold, count);
+	}
+
+	for (i = 0; i < SLI_LONGTERM_NR; i++) {
+		threshold = sli_convert_value(event_monitor->longterm_threshold[i], true);
+
+		seq_printf(sf, "%s: threshold: %llu\n", get_longterm_name(i), threshold);
+	}
+
+	return 0;
+}
+
 static int sli_enabled_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "%d\n", static_key_enabled(&sli_enabled));
@@ -610,7 +1031,7 @@ out:
 
 void sli_cgroup_free(struct cgroup *cgroup)
 {
-	struct sli_event *event;
+	struct sli_event *event, *event_tmp;
 
 	/*
 	 * Cgroup's subsys would be cleared before sli_cgroup_free() had been called.
@@ -623,7 +1044,8 @@ void sli_cgroup_free(struct cgroup *cgroup)
 	free_percpu(cgroup->sli_memlat_stat_percpu);
 	free_percpu(cgroup->sli_schedlat_stat_percpu);
 	/* Free memory from the event list */
-	list_for_each_entry(event, &cgroup->cgrp_event_monitor->event_head, event_node) {
+	list_for_each_entry_safe(event, event_tmp,
+				 &cgroup->cgrp_event_monitor->event_head, event_node) {
 		list_del(&event->event_node);
 		kfree(event);
 	}
