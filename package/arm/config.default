@@ -5093,6 +5093,7 @@ CONFIG_ARM_PMU_ACPI=y
 # end of Performance monitor support
 
 CONFIG_RAS=y
+CONFIG_PHYTIUM_S2500_DFX=y
 
 #
 # Android
