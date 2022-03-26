@@ -40,6 +40,8 @@
 #include <asm/tlbflush.h>
 #include <asm/traps.h>
 
+#include <linux/phytium/ras/s2500_ras.h>
+
 struct fault_info {
 	int	(*fn)(unsigned long addr, unsigned int esr,
 		      struct pt_regs *regs);
@@ -296,6 +298,9 @@ static void die_kernel_fault(const char *msg, unsigned long addr,
 
 	show_pte(addr);
 	die("Oops", regs, esr);
+#ifdef CONFIG_PHYTIUM_S2500_DFX
+        s2500_print_all_dfx_info();
+#endif
 	bust_spinlocks(0);
 	do_exit(SIGKILL);
 }

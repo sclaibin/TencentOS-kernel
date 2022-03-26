@@ -366,6 +366,9 @@ static void print_other_cpu_stall(unsigned long gp_seq)
 	if (rcu_cpu_stall_suppress)
 		return;
 
+#ifdef CONFIG_PHYTIUM_S2500_DFX
+	s2500_print_all_dfx_info();
+#endif
 	/*
 	 * OK, time to rat on our buddy...
 	 * See Documentation/RCU/stallwarn.txt for info on how to debug

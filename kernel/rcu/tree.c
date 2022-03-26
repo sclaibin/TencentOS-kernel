@@ -61,6 +61,7 @@
 
 #include "tree.h"
 #include "rcu.h"
+#include <linux/phytium/ras/s2500_ras.h>
 
 #ifdef MODULE_PARAM_PREFIX
 #undef MODULE_PARAM_PREFIX

@@ -42,6 +42,7 @@
 #include <asm/exception.h>
 #include <asm/system_misc.h>
 #include <asm/sysreg.h>
+#include <linux/phytium/ras/s2500_ras.h>
 
 static const char *handler[]= {
 	"Synchronous Abort",
@@ -860,6 +861,10 @@ void __noreturn arm64_serror_panic(struct pt_regs *regs, u32 esr)
 		__show_regs(regs);
 
 	nmi_panic(regs, "Asynchronous SError Interrupt");
+
+#ifdef CONFIG_PHYTIUM_S2500_DFX
+        s2500_print_all_dfx_info();
+#endif
 
 	cpu_park_loop();
 	unreachable();

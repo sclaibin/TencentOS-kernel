@@ -1,0 +1,1 @@
+obj-$(CONFIG_PHYTIUM_S2500_DFX)   += s2500_ras.o

@@ -1,0 +1,4 @@
+menuconfig PHYTIUM_S2500_DFX
+	bool "Phytium S2500 RAS/DFX features"
+	help
+	  Phytium S2500 RAS registers used for DFX.
