@@ -885,6 +885,15 @@ config CFS_BANDWIDTH
 	  restriction.
 	  See Documentation/scheduler/sched-bwc.rst for more information.
 
+config CFS_BANDWIDTH_BOOST
+	bool "CPU bandwidth boost for FAIR_GROUP_SCHED"
+	depends on CFS_BANDWIDTH
+	default n
+	help
+	  This option allows users to exceed the original CPU bandwidth limit
+	  when CPU resources are enough. But the bandwidth boost will be prohibited
+	  when CPU resources are stretched.
+
 config RT_GROUP_SCHED
 	bool "Group scheduling for SCHED_RR/FIFO"
 	depends on CGROUP_SCHED

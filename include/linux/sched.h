@@ -230,6 +230,10 @@ extern void io_schedule_finish(int token);
 extern long io_schedule_timeout(long timeout);
 extern void io_schedule(void);
 
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+extern void cgroupv2_boost_stat_show(struct seq_file *sf);
+#endif
+
 /**
  * struct prev_cputime - snapshot of system and user cputime
  * @utime: time spent in user mode

@@ -328,6 +328,34 @@ struct rt_rq;
 
 extern struct list_head task_groups;
 
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+#define CFS_BOOST_QUOTA		0x1u
+#define CFS_BOOST_CPUMASK	0x2u
+
+struct cfs_bandwidth_boost {
+	raw_spinlock_t	lock;
+	/* The cpumask that could be shared by cpu bandwidth boost */
+	cpumask_t	boost_cpumask;
+
+	u32		boost_nr_cpus;
+	u32		boost_high;
+	u32		boost_low;
+	u32		boost_reserve;
+
+	u64		boost_capacity;
+	u64		boost_runtime;
+	u64		boost_period;
+	u64		boost_cooldown;
+	unsigned long	last_overload_jiffies;
+
+	u32		boost_overload;
+	u32		overload_count;
+	struct hrtimer	period_timer;
+};
+
+extern struct cfs_bandwidth_boost def_bandwidth_boost;
+#endif
+
 struct cfs_bandwidth {
 #ifdef CONFIG_CFS_BANDWIDTH
 	raw_spinlock_t		lock;
@@ -354,6 +382,14 @@ struct cfs_bandwidth {
 	int			nr_burst;
 	u64			throttled_time;
 	u64			burst_time;
+#endif
+
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	u32			boost_mode;
+	u32			boost_count;
+	u64			boost_runtime;
+	u64			boost_assign_runtime;
+	u64			boost_quota;
 #endif
 };
 

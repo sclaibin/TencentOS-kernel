@@ -6654,6 +6654,225 @@ static struct kmem_cache *task_group_cache __read_mostly;
 DECLARE_PER_CPU(cpumask_var_t, load_balance_mask);
 DECLARE_PER_CPU(cpumask_var_t, select_idle_mask);
 
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+static DEFINE_STATIC_KEY_FALSE(bandwidth_boost_enabled);
+struct cfs_bandwidth_boost def_bandwidth_boost;
+
+static inline struct task_group *css_tg(struct cgroup_subsys_state *css);
+
+static enum hrtimer_restart bandwidth_boost_period_timer(struct hrtimer *timer)
+{
+	struct cfs_bandwidth_boost *cfs_boost =
+			container_of(timer, struct cfs_bandwidth_boost, period_timer);
+
+	raw_spin_lock(&cfs_boost->lock);
+	hrtimer_forward_now(&cfs_boost->period_timer, ns_to_ktime(cfs_boost->boost_period));
+	raw_spin_unlock(&cfs_boost->lock);
+
+	return HRTIMER_RESTART;
+}
+
+static void init_root_bandwidth_boost(struct cfs_bandwidth_boost *cfs_boost)
+{
+	raw_spin_lock_init(&cfs_boost->lock);
+	hrtimer_init(&cfs_boost->period_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
+	cfs_boost->period_timer.function = bandwidth_boost_period_timer;
+	cfs_boost->last_overload_jiffies = jiffies;
+}
+
+static inline void start_bandwidth_boost_timer(void)
+{
+	hrtimer_forward_now(&def_bandwidth_boost.period_timer,
+			    ns_to_ktime(def_bandwidth_boost.boost_period));
+	hrtimer_start_expires(&def_bandwidth_boost.period_timer, HRTIMER_MODE_ABS_PINNED);
+}
+
+static inline void stop_bandwidth_boost_timer(void)
+{
+	hrtimer_cancel(&def_bandwidth_boost.period_timer);
+}
+
+static int cpu_boost_cpumask_show(struct seq_file *sf, void *v)
+{
+	seq_printf(sf, "%*pbl\n", cpumask_pr_args(&def_bandwidth_boost.boost_cpumask));
+
+	return 0;
+}
+
+static ssize_t cpu_boost_cpumask_write(struct kernfs_open_file *of,
+				       char *buf, size_t nbytes, loff_t off)
+{
+	int ret;
+	cpumask_t boost_cpumask;
+
+	ret = cpulist_parse(buf, &boost_cpumask);
+	if (ret) {
+		ret = 0;
+		goto out;
+	}
+
+	raw_spin_lock_irq(&def_bandwidth_boost.lock);
+	ret = cpumask_subset(&boost_cpumask, cpu_online_mask);
+	if (ret) {
+		cpumask_copy(&def_bandwidth_boost.boost_cpumask, &boost_cpumask);
+		def_bandwidth_boost.boost_nr_cpus = cpumask_weight(&boost_cpumask);
+	}
+	raw_spin_unlock_irq(&def_bandwidth_boost.lock);
+
+out:
+	return ret ? nbytes : -EINVAL;
+}
+
+static int cpu_boost_wmark_show(struct seq_file *sf, void *v)
+{
+	seq_printf(sf, "high: %u, low: %u, reserve: %u\n", def_bandwidth_boost.boost_high,
+		   def_bandwidth_boost.boost_low, def_bandwidth_boost.boost_reserve);
+
+	return 0;
+}
+
+/* String format is "high low reserve" watermark and only be decimal digit  */
+static ssize_t cpu_boost_wmark_write(struct kernfs_open_file *of,
+				     char *buf, size_t nbytes, loff_t off)
+{
+	u32 high, low, reserve;
+
+	if (sscanf(buf, "%u %u %u", &high, &low, &reserve) < 3)
+		return -EINVAL;
+
+	if (low > high)
+		return -EINVAL;
+
+	if ((high > 1024) || (low > 1024) || (reserve > 1024))
+		return -EINVAL;
+
+	raw_spin_lock_irq(&def_bandwidth_boost.lock);
+	def_bandwidth_boost.boost_high = high;
+	def_bandwidth_boost.boost_low = low;
+	def_bandwidth_boost.boost_reserve = reserve;
+	raw_spin_unlock_irq(&def_bandwidth_boost.lock);
+
+	return nbytes;
+}
+
+static int cpu_boost_period_show(struct seq_file *sf, void *v)
+{
+	seq_printf(sf, "period: %llu, cooldown: %llu\n",
+		   def_bandwidth_boost.boost_period / NSEC_PER_USEC,
+		   def_bandwidth_boost.boost_cooldown / NSEC_PER_USEC);
+
+	return 0;
+}
+
+/* String format is "period cooldown" time and only be decimal digit */
+static ssize_t cpu_boost_period_write(struct kernfs_open_file *of,
+				      char *buf, size_t nbytes, loff_t off)
+{
+	u64 period, cooldown;
+
+	if (sscanf(buf, "%llu %llu", &period, &cooldown) < 2)
+		return -EINVAL;
+
+	inode_lock(file_inode(of->file));
+	if (period && !def_bandwidth_boost.boost_period) {
+		def_bandwidth_boost.boost_period = period * NSEC_PER_USEC;
+		def_bandwidth_boost.boost_cooldown = cooldown * NSEC_PER_USEC;
+		start_bandwidth_boost_timer();
+		static_branch_enable(&bandwidth_boost_enabled);
+	} else if (!period && def_bandwidth_boost.boost_period) {
+		static_branch_disable(&bandwidth_boost_enabled);
+		stop_bandwidth_boost_timer();
+		def_bandwidth_boost.boost_period = 0;
+		def_bandwidth_boost.boost_cooldown = 0;
+	} else {
+		nbytes = -EINVAL;
+		pr_info("Boost period should be disabled before reset the value\n");
+	}
+	inode_unlock(file_inode(of->file));
+
+	return nbytes;
+}
+
+static u64 cpu_boost_mode_read(struct cgroup_subsys_state *css,
+			       struct cftype *cft)
+{
+	return css_tg(css)->cfs_bandwidth.boost_mode;
+}
+
+static ssize_t cpu_boost_mode_write(struct kernfs_open_file *of,
+				    char *buf, size_t nbytes, loff_t off)
+{
+	u32 mask, val;
+	struct cfs_bandwidth *cfs_b;
+
+	if (kstrtou32(buf, 0, &val))
+		return -EINVAL;
+
+	mask = ~(CFS_BOOST_QUOTA | CFS_BOOST_CPUMASK);
+	if (val & mask)
+		return -EINVAL;
+
+	cfs_b = &css_tg(of_css(of))->cfs_bandwidth;
+	raw_spin_lock_irq(&cfs_b->lock);
+	cfs_b->boost_mode = val;
+	raw_spin_unlock_irq(&cfs_b->lock);
+
+	return nbytes;
+}
+
+static int cpu_boost_quota_show(struct seq_file *sf, void *v)
+{
+	s64 val;
+	struct cfs_bandwidth *cfs_b;
+
+	cfs_b = &css_tg(seq_css(sf))->cfs_bandwidth;
+	if (cfs_b->boost_quota == RUNTIME_INF)
+		val = -1;
+	else
+		val = cfs_b->boost_quota / NSEC_PER_USEC;
+
+	seq_printf(sf, "%lld\n", val);
+	return 0;
+}
+
+static ssize_t cpu_boost_quota_write(struct kernfs_open_file *of,
+				     char *buf, size_t nbytes, loff_t off)
+{
+	s64 val;
+	struct cfs_bandwidth *cfs_b;
+
+	if (kstrtos64(buf, 0, &val))
+		return -EINVAL;
+
+	cfs_b = &css_tg(of_css(of))->cfs_bandwidth;
+	raw_spin_lock_irq(&cfs_b->lock);
+	if (val < 0)
+		cfs_b->boost_quota = RUNTIME_INF;
+	else
+		cfs_b->boost_quota = val * NSEC_PER_USEC;
+	raw_spin_unlock_irq(&cfs_b->lock);
+
+	return nbytes;
+}
+
+void cgroupv2_boost_stat_show(struct seq_file *sf)
+{
+	struct cfs_bandwidth *cfs_b;
+
+	if (!static_branch_likely(&bandwidth_boost_enabled))
+		return;
+
+	cfs_b = &css_tg(seq_css(sf))->cfs_bandwidth;
+	seq_printf(sf, "boost_count: %u\n", cfs_b->boost_count);
+	seq_printf(sf, "overload count: %u\n", def_bandwidth_boost.overload_count);
+	seq_printf(sf, "last_overload_jiffies: %lu\n",
+		   def_bandwidth_boost.last_overload_jiffies);
+	seq_printf(sf, "jiffies: %lu\n", jiffies);
+	seq_printf(sf, "capacity: %llu\n", def_bandwidth_boost.boost_capacity / NSEC_PER_USEC);
+	seq_printf(sf, "runtime: %llu\n", def_bandwidth_boost.boost_runtime / NSEC_PER_USEC);
+}
+#endif
+
 void __init sched_init(void)
 {
 	unsigned long ptr = 0;
@@ -6716,6 +6935,10 @@ void __init sched_init(void)
 	INIT_LIST_HEAD(&root_task_group.siblings);
 	autogroup_init(&init_task);
 #endif /* CONFIG_CGROUP_SCHED */
+
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	init_root_bandwidth_boost(&def_bandwidth_boost);
+#endif
 
 	for_each_possible_cpu(i) {
 		struct rq *rq;
@@ -7800,6 +8023,9 @@ static int cpu_cfs_stat_show(struct seq_file *sf, void *v)
 {
 	struct task_group *tg = css_tg(seq_css(sf));
 	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	struct cgroup *cgrp;
+#endif
 
 	seq_printf(sf, "nr_periods %d\n", cfs_b->nr_periods);
 	seq_printf(sf, "nr_throttled %d\n", cfs_b->nr_throttled);
@@ -7817,6 +8043,27 @@ static int cpu_cfs_stat_show(struct seq_file *sf, void *v)
 
 	seq_printf(sf, "nr_burst %d\n", cfs_b->nr_burst);
 	seq_printf(sf, "burst_time %llu\n", cfs_b->burst_time);
+
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	if (!static_branch_likely(&bandwidth_boost_enabled))
+		return 0;
+
+	cgrp = seq_css(sf)->cgroup;
+	if (cgroup_parent(cgrp)) {
+                struct cfs_bandwidth *cfs_b = &css_tg(seq_css(sf))->cfs_bandwidth;
+
+                seq_printf(sf, "boost_count: %u\n", cfs_b->boost_count);
+        } else {
+		seq_printf(sf, "overload count: %u\n", def_bandwidth_boost.overload_count);
+		seq_printf(sf, "last_overload_jiffies: %lu\n",
+			   def_bandwidth_boost.last_overload_jiffies);
+		seq_printf(sf, "jiffies: %lu\n", jiffies);
+		seq_printf(sf, "capacity: %llu\n",
+			   def_bandwidth_boost.boost_capacity / NSEC_PER_USEC);
+		seq_printf(sf, "runtime: %llu\n",
+			   def_bandwidth_boost.boost_runtime / NSEC_PER_USEC);
+        }
+#endif
 
 	return 0;
 }
@@ -7900,6 +8147,38 @@ static struct cftype cpu_legacy_files[] = {
 	{
 		.name = "stat",
 		.seq_show = cpu_cfs_stat_show,
+	},
+#endif
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	{
+		.name = "boost_cpumask",
+		.flags = CFTYPE_ONLY_ON_ROOT,
+		.seq_show = cpu_boost_cpumask_show,
+		.write = cpu_boost_cpumask_write,
+	},
+	{
+		.name = "boost_wmark",
+		.flags = CFTYPE_ONLY_ON_ROOT,
+		.seq_show = cpu_boost_wmark_show,
+		.write = cpu_boost_wmark_write,
+	},
+	{
+		.name = "boost_period",
+		.flags = CFTYPE_ONLY_ON_ROOT,
+		.seq_show = cpu_boost_period_show,
+		.write = cpu_boost_period_write,
+	},
+	{
+		.name = "boost_mode",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = cpu_boost_mode_read,
+		.write = cpu_boost_mode_write,
+	},
+	{
+		.name = "boost_quota",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = cpu_boost_quota_show,
+		.write = cpu_boost_quota_write,
 	},
 #endif
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -8101,6 +8380,38 @@ static struct cftype cpu_files[] = {
 		.flags = CFTYPE_NOT_ON_ROOT,
 		.seq_show = cpu_max_show,
 		.write = cpu_max_write,
+	},
+#endif
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	{
+		.name = "boost_cpumask",
+		.flags = CFTYPE_ONLY_ON_ROOT,
+		.seq_show = cpu_boost_cpumask_show,
+		.write = cpu_boost_cpumask_write,
+	},
+	{
+		.name = "boost_wmark",
+		.flags = CFTYPE_ONLY_ON_ROOT,
+		.seq_show = cpu_boost_wmark_show,
+		.write = cpu_boost_wmark_write,
+	},
+	{
+		.name = "boost_period",
+		.flags = CFTYPE_ONLY_ON_ROOT,
+		.seq_show = cpu_boost_period_show,
+		.write = cpu_boost_period_write,
+	},
+	{
+		.name = "boost_mode",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = cpu_boost_mode_read,
+		.write = cpu_boost_mode_write,
+	},
+	{
+		.name = "boost_quota",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = cpu_boost_quota_show,
+		.write = cpu_boost_quota_write,
 	},
 #endif
 #ifdef CONFIG_UCLAMP_TASK_GROUP

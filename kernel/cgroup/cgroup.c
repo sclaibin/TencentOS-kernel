@@ -3615,6 +3615,9 @@ static int cpu_stat_show(struct seq_file *seq, void *v)
 #ifdef CONFIG_CGROUP_SCHED
 	ret = cgroup_extra_stat_show(seq, cgrp, cpu_cgrp_id);
 #endif
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	cgroupv2_boost_stat_show(seq);
+#endif
 	return ret;
 }
 
