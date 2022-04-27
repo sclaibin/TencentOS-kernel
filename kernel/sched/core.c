@@ -3616,6 +3616,10 @@ DEFINE_PER_CPU(struct kernel_cpustat, kernel_cpustat);
 EXPORT_PER_CPU_SYMBOL(kstat);
 EXPORT_PER_CPU_SYMBOL(kernel_cpustat);
 
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+static inline void bandwidth_boost_tick(void);
+#endif
+
 /*
  * The function fair_sched_class.update_curr accesses the struct curr
  * and its field curr->exec_start; when called from task_sched_runtime(),
@@ -3706,6 +3710,9 @@ void scheduler_tick(void)
 	trigger_load_balance(rq);
 #endif
 	sli_update_tick(curr);
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	bandwidth_boost_tick();
+#endif
 }
 
 #ifdef CONFIG_NO_HZ_FULL
@@ -6660,12 +6667,100 @@ struct cfs_bandwidth_boost def_bandwidth_boost;
 
 static inline struct task_group *css_tg(struct cgroup_subsys_state *css);
 
+static inline void bandwidth_boost_tick(void)
+{
+	if (!static_branch_likely(&bandwidth_boost_enabled))
+		return;
+
+	/*
+	 * The tick may ocurred in idle task's context, and there is not any
+	 * task prepare to run. So it shouldn't be accumulated to pcpu_ticks.
+	 */
+	if (idle_cpu(smp_processor_id()))
+		return;
+
+	this_cpu_inc(*def_bandwidth_boost.pcpu_ticks);
+}
+
+static void update_bandwidth_boost_runtime(struct cfs_bandwidth_boost *cfs_boost)
+{
+	int cpu;
+	u64 cpus_capacity, idle_capacity, cpu_ticks = 0;
+	static u32 nr_cpus;
+
+	if (!cfs_boost->boost_nr_cpus)
+		goto reset;
+
+	for_each_cpu(cpu, &cfs_boost->boost_cpumask)
+		cpu_ticks += *per_cpu_ptr(cfs_boost->pcpu_ticks, cpu);
+
+	idle_capacity = cpu_ticks - cfs_boost->last_ticks;
+	cfs_boost->last_ticks = cpu_ticks;
+
+	/*
+	 * If the boost_cpumask was modified when the timer had been queued, this
+	 * round of bandwidth calculation should be abandoned. Compare with cpumask,
+	 * nr_cpus is not pretty accurate, but it is more efficient and could reduce
+	 * a lot of overhead.
+	 */
+	if (nr_cpus != cfs_boost->boost_nr_cpus) {
+		nr_cpus = cfs_boost->boost_nr_cpus;
+		goto reset;
+	}
+
+	cpus_capacity = cfs_boost->boost_nr_cpus * cfs_boost->boost_period;
+	idle_capacity = cpus_capacity - jiffies_to_nsecs(idle_capacity);
+
+	/*
+	 * The cpumask change could lead to the nagetive value, so we add the sanity
+	 * check here.
+	 */
+	if ((s64)idle_capacity <= 0)
+		goto reset;
+
+	/*
+	 * If bandwidth bootst was overloaded before, we should check whether the system
+	 * already had enough CPU resource.
+	 */
+	if (cfs_boost->boost_overload) {
+		unsigned long expired_jiffies = cfs_boost->last_overload_jiffies +
+				nsecs_to_jiffies(cfs_boost->boost_cooldown);
+
+		if (time_before(jiffies, expired_jiffies))
+			return;
+
+		if (idle_capacity < ((cpus_capacity * cfs_boost->boost_high) >> 10))
+			return;
+
+		cfs_boost->boost_overload = 0;
+	} else {
+		if (idle_capacity <= ((cpus_capacity * cfs_boost->boost_low) >> 10)) {
+			cfs_boost->overload_count++;
+			cfs_boost->boost_overload = 1;
+			cfs_boost->last_overload_jiffies = jiffies;
+			goto reset;
+		}
+
+		idle_capacity -= (cpus_capacity * cfs_boost->boost_reserve) >> 10;
+		if ((s64)idle_capacity <= 0)
+			goto reset;
+	}
+
+
+	cfs_boost->boost_capacity = cfs_boost->boost_runtime = idle_capacity;
+	return;
+
+reset:
+	cfs_boost->boost_capacity = cfs_boost->boost_runtime = 0;
+}
+
 static enum hrtimer_restart bandwidth_boost_period_timer(struct hrtimer *timer)
 {
 	struct cfs_bandwidth_boost *cfs_boost =
 			container_of(timer, struct cfs_bandwidth_boost, period_timer);
 
 	raw_spin_lock(&cfs_boost->lock);
+	update_bandwidth_boost_runtime(cfs_boost);
 	hrtimer_forward_now(&cfs_boost->period_timer, ns_to_ktime(cfs_boost->boost_period));
 	raw_spin_unlock(&cfs_boost->lock);
 
@@ -6678,6 +6773,8 @@ static void init_root_bandwidth_boost(struct cfs_bandwidth_boost *cfs_boost)
 	hrtimer_init(&cfs_boost->period_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
 	cfs_boost->period_timer.function = bandwidth_boost_period_timer;
 	cfs_boost->last_overload_jiffies = jiffies;
+	cfs_boost->pcpu_ticks = alloc_percpu(u64);
+	BUG_ON(!cfs_boost->pcpu_ticks);
 }
 
 static inline void start_bandwidth_boost_timer(void)
@@ -6769,6 +6866,17 @@ static ssize_t cpu_boost_period_write(struct kernfs_open_file *of,
 				      char *buf, size_t nbytes, loff_t off)
 {
 	u64 period, cooldown;
+
+	/*
+	 * In order to use cfs bandwidth boost, we calculate the idle capacity of system
+	 * in the tick handler. But when nohz full is enabled, the tick of CPU will be
+	 * stoppted when there is only one process on the rq. The idle capacity calculation
+	 * will become invalid. So cfs bandwidth boost must work with nohz full disabled.
+	 */
+	if (tick_nohz_full_enabled()) {
+		pr_info("CFS bandwidth boost cann't work with nohz full enabled\n");
+		return -EINVAL;
+	}
 
 	if (sscanf(buf, "%llu %llu", &period, &cooldown) < 2)
 		return -EINVAL;

@@ -348,6 +348,9 @@ struct cfs_bandwidth_boost {
 	u64		boost_cooldown;
 	unsigned long	last_overload_jiffies;
 
+	u64		last_ticks;
+	u64 __percpu	*pcpu_ticks;
+
 	u32		boost_overload;
 	u32		overload_count;
 	struct hrtimer	period_timer;
