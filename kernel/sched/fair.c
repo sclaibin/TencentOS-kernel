@@ -4438,6 +4438,11 @@ static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
 			cfs_b->runtime -= amount;
 			cfs_b->idle = 0;
 		}
+
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+		if (cfs_b->runtime == 0)
+			assign_bandwidth_boost_runtime(cfs_b, &amount, min_amount);
+#endif
 	}
 
 	cfs_rq->runtime_remaining += amount;
@@ -4759,6 +4764,9 @@ static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, u
 		goto out_deactivate;
 
 	__refill_cfs_bandwidth_runtime(cfs_b, overrun);
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	reset_bandwidth_boost_runtime(cfs_b);
+#endif
 
 	if (!throttled) {
 		/* mark as potentially idle for the upcoming period */

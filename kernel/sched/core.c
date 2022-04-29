@@ -6667,8 +6667,66 @@ struct cfs_bandwidth_boost def_bandwidth_boost;
 
 static inline struct task_group *css_tg(struct cgroup_subsys_state *css);
 
+inline void reset_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b)
+{
+	if (!static_branch_likely(&bandwidth_boost_enabled))
+		return;
+
+	if (cfs_b->boost_quota)
+		cfs_b->boost_runtime = cfs_b->boost_assign_runtime = 0;
+}
+
+void assign_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b,
+				    u64 *target_amount, u64 min_amount)
+{
+	u64 amount;
+
+	if (!static_branch_likely(&bandwidth_boost_enabled))
+		return;
+
+	if (!cfs_b->boost_quota)
+		return;
+
+	if (def_bandwidth_boost.boost_overload)
+		return;
+
+	if (cfs_b->boost_runtime >= min_amount)
+		goto simple;
+
+	if (cfs_b->boost_assign_runtime == cfs_b->boost_quota)
+		goto simple;
+
+	raw_spin_lock(&def_bandwidth_boost.lock);
+	if (def_bandwidth_boost.boost_runtime > 0) {
+		if (cfs_b->boost_quota == RUNTIME_INF) {
+			amount = min((cfs_b->quota >> 2), def_bandwidth_boost.boost_runtime);
+		} else {
+			amount = min((cfs_b->boost_quota - cfs_b->boost_assign_runtime),
+				     cfs_b->boost_quota >> 2);
+			amount = min(amount, def_bandwidth_boost.boost_runtime);
+		}
+
+		def_bandwidth_boost.boost_runtime -= amount;
+		cfs_b->boost_assign_runtime += amount;
+		cfs_b->boost_runtime += amount;
+		cfs_b->boost_count++;
+	}
+	raw_spin_unlock(&def_bandwidth_boost.lock);
+
+simple:
+	if (cfs_b->boost_runtime > 0) {
+		amount = min(cfs_b->boost_runtime, min_amount);
+		cfs_b->boost_runtime -= amount;
+		*target_amount += amount;
+	}
+}
+
 static inline void bandwidth_boost_tick(void)
 {
+	u64 boost_runtime;
+	struct rq *rq;
+	struct cgroup_subsys_state *css;
+
 	if (!static_branch_likely(&bandwidth_boost_enabled))
 		return;
 
@@ -6676,7 +6734,14 @@ static inline void bandwidth_boost_tick(void)
 	 * The tick may ocurred in idle task's context, and there is not any
 	 * task prepare to run. So it shouldn't be accumulated to pcpu_ticks.
 	 */
-	if (idle_cpu(smp_processor_id()))
+	rq = cpu_rq(smp_processor_id());
+	if (rq->curr == rq->idle)
+		return;
+
+	css = task_get_css(rq->curr, cpu_cgrp_id);
+	boost_runtime = css_tg(css)->cfs_bandwidth.boost_runtime;
+	css_put(css);
+	if (boost_runtime)
 		return;
 
 	this_cpu_inc(*def_bandwidth_boost.pcpu_ticks);

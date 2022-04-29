@@ -514,6 +514,12 @@ extern void sched_offline_group(struct task_group *tg);
 
 extern void sched_move_task(struct task_struct *tsk);
 
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+extern void assign_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b,
+					   u64 *target_amount, u64 min_amount);
+extern inline void reset_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b);
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 extern int sched_group_set_shares(struct task_group *tg, unsigned long shares);
 
