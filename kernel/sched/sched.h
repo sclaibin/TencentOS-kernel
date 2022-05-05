@@ -390,6 +390,9 @@ struct cfs_bandwidth {
 #ifdef CONFIG_CFS_BANDWIDTH_BOOST
 	u32			boost_mode;
 	u32			boost_count;
+	u32			boosting_cpumask;
+	u32			boosting_idle_interval;
+	unsigned long		boosting_jiffies;
 	u64			boost_runtime;
 	u64			boost_assign_runtime;
 	u64			boost_quota;
@@ -518,6 +521,9 @@ extern void sched_move_task(struct task_struct *tsk);
 extern void assign_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b,
 					   u64 *target_amount, u64 min_amount);
 extern inline void reset_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b);
+
+extern void init_cfs_bandwidth_boost(struct cfs_bandwidth *cfs_b,
+				     struct cfs_bandwidth *parent_cfs_b);
 #endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED

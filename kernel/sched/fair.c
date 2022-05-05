@@ -10419,6 +10419,9 @@ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
 	tg->shares = NICE_0_LOAD;
 
 	init_cfs_bandwidth(tg_cfs_bandwidth(tg));
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	init_cfs_bandwidth_boost(tg_cfs_bandwidth(tg), tg_cfs_bandwidth(parent));
+#endif
 
 	for_each_possible_cpu(i) {
 		cfs_rq = kzalloc_node(sizeof(struct cfs_rq),

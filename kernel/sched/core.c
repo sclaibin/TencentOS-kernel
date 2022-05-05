@@ -6667,6 +6667,14 @@ struct cfs_bandwidth_boost def_bandwidth_boost;
 
 static inline struct task_group *css_tg(struct cgroup_subsys_state *css);
 
+void init_cfs_bandwidth_boost(struct cfs_bandwidth *cfs_b, struct cfs_bandwidth *parent_cfs_b)
+{
+	cfs_b->boost_mode = parent_cfs_b->boost_mode;
+	cfs_b->boosting_idle_interval = parent_cfs_b->boosting_idle_interval;
+	cfs_b->boost_quota = parent_cfs_b->boost_quota;
+	cfs_b->boosting_jiffies = jiffies;
+}
+
 inline void reset_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b)
 {
 	if (!static_branch_likely(&bandwidth_boost_enabled))
@@ -6674,6 +6682,10 @@ inline void reset_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b)
 
 	if (cfs_b->boost_quota)
 		cfs_b->boost_runtime = cfs_b->boost_assign_runtime = 0;
+
+	if (cfs_b->boosting_cpumask && time_after(jiffies, cfs_b->boosting_jiffies +
+						  cfs_b->boosting_idle_interval))
+		cfs_b->boosting_cpumask = 0;
 }
 
 void assign_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b,
@@ -6710,6 +6722,11 @@ void assign_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b,
 		cfs_b->boost_assign_runtime += amount;
 		cfs_b->boost_runtime += amount;
 		cfs_b->boost_count++;
+
+		if (cfs_b->boost_mode & CFS_BOOST_CPUMASK) {
+			cfs_b->boosting_jiffies = jiffies;
+			cfs_b->boosting_cpumask = 1;
+		}
 	}
 	raw_spin_unlock(&def_bandwidth_boost.lock);
 
@@ -7023,6 +7040,28 @@ static ssize_t cpu_boost_quota_write(struct kernfs_open_file *of,
 		cfs_b->boost_quota = RUNTIME_INF;
 	else
 		cfs_b->boost_quota = val * NSEC_PER_USEC;
+	raw_spin_unlock_irq(&cfs_b->lock);
+
+	return nbytes;
+}
+
+static u64 cpu_boost_interval_read(struct cgroup_subsys_state *css, struct cftype *cft)
+{
+	return jiffies_to_usecs(css_tg(css)->cfs_bandwidth.boosting_idle_interval);
+}
+
+static ssize_t cpu_boost_interval_write(struct kernfs_open_file *of,
+					char *buf, size_t nbytes, loff_t off)
+{
+	u32 val;
+	struct cfs_bandwidth *cfs_b;
+
+	if (kstrtou32(buf, 0, &val))
+		return -EINVAL;
+
+	cfs_b = &css_tg(of_css(of))->cfs_bandwidth;
+	raw_spin_lock_irq(&cfs_b->lock);
+	cfs_b->boosting_idle_interval = usecs_to_jiffies(val);
 	raw_spin_unlock_irq(&cfs_b->lock);
 
 	return nbytes;
@@ -8353,6 +8392,12 @@ static struct cftype cpu_legacy_files[] = {
 		.seq_show = cpu_boost_quota_show,
 		.write = cpu_boost_quota_write,
 	},
+	{
+		.name = "boost_idle_interval",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = cpu_boost_interval_read,
+		.write = cpu_boost_interval_write,
+	},
 #endif
 #ifdef CONFIG_RT_GROUP_SCHED
 	{
@@ -8585,6 +8630,12 @@ static struct cftype cpu_files[] = {
 		.flags = CFTYPE_NOT_ON_ROOT,
 		.seq_show = cpu_boost_quota_show,
 		.write = cpu_boost_quota_write,
+	},
+	{
+		.name = "boost_idle_interval",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.read_u64 = cpu_boost_interval_read,
+		.write = cpu_boost_interval_write,
 	},
 #endif
 #ifdef CONFIG_UCLAMP_TASK_GROUP
