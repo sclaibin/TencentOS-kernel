@@ -6667,6 +6667,107 @@ struct cfs_bandwidth_boost def_bandwidth_boost;
 
 static inline struct task_group *css_tg(struct cgroup_subsys_state *css);
 
+bool cpumask_affinity_boost(int cpu, struct task_struct *tsk)
+{
+	int ret;
+	struct cgroup *cgrp;
+	struct cgroup_subsys_state *css;
+
+	if (!static_branch_likely(&bandwidth_boost_enabled))
+		return false;
+
+	cgrp = task_cgroup(tsk, cpu_cgrp_id);
+	if (!cgroup_parent(cgrp))
+		return false;
+
+	css = task_get_css(tsk, cpu_cgrp_id);
+	ret = css_tg(css)->cfs_bandwidth.boosting_cpumask;
+	css_put(css);
+
+	if (!ret)
+		return false;
+
+	if (cpumask_test_cpu(cpu, &def_bandwidth_boost.boost_cpumask))
+		return true;
+
+	return false;
+}
+
+bool cpumask_intersects_boost(struct cpumask *cpumask, struct task_struct *tsk)
+{
+	int ret;
+	struct cgroup *cgrp;
+	struct cgroup_subsys_state *css;
+
+	if (!static_branch_likely(&bandwidth_boost_enabled))
+		return false;
+
+	cgrp = task_cgroup(tsk, cpu_cgrp_id);
+	if (!cgroup_parent(cgrp))
+		return false;
+
+	css = task_get_css(tsk, cpu_cgrp_id);
+	ret = css_tg(css)->cfs_bandwidth.boosting_cpumask;
+	css_put(css);
+
+	if (!ret)
+		return false;
+
+	if (cpumask_intersects(cpumask, &def_bandwidth_boost.boost_cpumask))
+		return true;
+
+	return false;
+}
+
+void cpumask_and_boost(struct cpumask *dst_cpumask, struct cpumask *src_cpumask,
+		       struct task_struct *tsk)
+{
+	int ret;
+	struct cgroup *cgrp;
+	struct cgroup_subsys_state *css;
+
+	if (!static_branch_likely(&bandwidth_boost_enabled))
+		return;
+
+	cgrp = task_cgroup(tsk, cpu_cgrp_id);
+	if (!cgroup_parent(cgrp))
+		return;
+
+	css = task_get_css(tsk, cpu_cgrp_id);
+	ret = css_tg(css)->cfs_bandwidth.boosting_cpumask;
+	css_put(css);
+
+	if (!ret)
+		return;
+
+	cpumask_or(dst_cpumask, &def_bandwidth_boost.boost_cpumask, tsk->cpus_ptr);
+	cpumask_and(dst_cpumask, dst_cpumask, src_cpumask);
+}
+
+void cpumask_or_boost(struct cpumask *cpumask, struct task_struct *tsk)
+{
+	int ret;
+	struct cgroup *cgrp;
+	struct cgroup_subsys_state *css;
+
+	cpumask_copy(cpumask, tsk->cpus_ptr);
+	if (!static_branch_likely(&bandwidth_boost_enabled))
+		return;
+
+	cgrp = task_cgroup(tsk, cpu_cgrp_id);
+	if (!cgroup_parent(cgrp))
+		return;
+
+	css = task_get_css(tsk, cpu_cgrp_id);
+	ret = css_tg(css)->cfs_bandwidth.boosting_cpumask;
+	css_put(css);
+
+	if (!ret)
+		return;
+
+	cpumask_or(cpumask, cpumask, &def_bandwidth_boost.boost_cpumask);
+}
+
 void init_cfs_bandwidth_boost(struct cfs_bandwidth *cfs_b, struct cfs_bandwidth *parent_cfs_b)
 {
 	cfs_b->boost_mode = parent_cfs_b->boost_mode;

@@ -518,6 +518,12 @@ extern void sched_offline_group(struct task_group *tg);
 extern void sched_move_task(struct task_struct *tsk);
 
 #ifdef CONFIG_CFS_BANDWIDTH_BOOST
+extern bool cpumask_affinity_boost(int cpu, struct task_struct *tsk);
+extern bool cpumask_intersects_boost(struct cpumask *cpumask, struct task_struct *tsk);
+extern void cpumask_or_boost(struct cpumask *cpumask, struct task_struct *tsk);
+extern void cpumask_and_boost(struct cpumask *dst_cpumask, struct cpumask *src_cpumask,
+			      struct task_struct *tsk);
+
 extern void assign_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b,
 					   u64 *target_amount, u64 min_amount);
 extern inline void reset_bandwidth_boost_runtime(struct cfs_bandwidth *cfs_b);

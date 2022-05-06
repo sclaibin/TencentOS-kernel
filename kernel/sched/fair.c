@@ -5707,9 +5707,15 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p,
 		int i;
 
 		/* Skip over this group if it has no CPUs allowed */
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+		if (!cpumask_intersects(sched_group_span(group), p->cpus_ptr))
+			if (!cpumask_intersects_boost(sched_group_span(group), p))
+				continue;
+#else
 		if (!cpumask_intersects(sched_group_span(group),
 					p->cpus_ptr))
 			continue;
+#endif
 
 		local_group = cpumask_test_cpu(this_cpu,
 					       sched_group_span(group));
@@ -5829,13 +5835,21 @@ find_idlest_group_cpu(struct sched_group *group, struct task_struct *p, int this
 	int least_loaded_cpu = this_cpu;
 	int shallowest_idle_cpu = -1, si_cpu = -1;
 	int i;
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	cpumask_t cpus_mask;
+#endif
 
 	/* Check if we have any choice: */
 	if (group->group_weight == 1)
 		return cpumask_first(sched_group_span(group));
 
 	/* Traverse only the allowed CPUs */
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	cpumask_or_boost(&cpus_mask, p);
+	for_each_cpu_and(i, sched_group_span(group), &cpus_mask) {
+#else
 	for_each_cpu_and(i, sched_group_span(group), p->cpus_ptr) {
+#endif
 		if (available_idle_cpu(i)) {
 			struct rq *rq = cpu_rq(i);
 			struct cpuidle_state *idle = idle_get_state(rq);
@@ -5884,8 +5898,14 @@ static inline int find_idlest_cpu(struct sched_domain *sd, struct task_struct *p
 {
 	int new_cpu = cpu;
 
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	if (!cpumask_intersects(sched_domain_span(sd), p->cpus_ptr))
+		if (!cpumask_intersects_boost(sched_domain_span(sd), p))
+			return prev_cpu;
+#else
 	if (!cpumask_intersects(sched_domain_span(sd), p->cpus_ptr))
 		return prev_cpu;
+#endif
 
 	/*
 	 * We need task's util for capacity_spare_without, sync it up to
@@ -6002,6 +6022,9 @@ static int select_idle_core(struct task_struct *p, struct sched_domain *sd, int 
 		return -1;
 
 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	cpumask_and_boost(cpus, sched_domain_span(sd), p);
+#endif
 
 	for_each_cpu_wrap(core, cpus, target) {
 		bool idle = true;
@@ -6035,7 +6058,11 @@ static int select_idle_smt(struct task_struct *p, struct sched_domain *sd, int t
 		return -1;
 
 	for_each_cpu(cpu, cpu_smt_mask(target)) {
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+		if (!(cpumask_test_cpu(cpu, p->cpus_ptr) || cpumask_affinity_boost(cpu, p)) ||
+#else
 		if (!cpumask_test_cpu(cpu, p->cpus_ptr) ||
+#endif
 		    !cpumask_test_cpu(cpu, sched_domain_span(sd)))
 			continue;
 		if (available_idle_cpu(cpu))
@@ -6101,6 +6128,9 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int t
 	time = cpu_clock(this);
 
 	cpumask_and(cpus, sched_domain_span(sd), p->cpus_ptr);
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	cpumask_and_boost(cpus, sched_domain_span(sd), p);
+#endif
 
 	for_each_cpu_wrap(cpu, cpus, target) {
 		if (!--nr)
@@ -6143,7 +6173,12 @@ static int select_idle_sibling(struct task_struct *p, int prev, int target)
 	    recent_used_cpu != target &&
 	    cpus_share_cache(recent_used_cpu, target) &&
 	    (available_idle_cpu(recent_used_cpu) || sched_idle_cpu(recent_used_cpu)) &&
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	    (cpumask_test_cpu(p->recent_used_cpu, p->cpus_ptr) ||
+	     cpumask_affinity_boost(p->recent_used_cpu, p))) {
+#else
 	    cpumask_test_cpu(p->recent_used_cpu, p->cpus_ptr)) {
+#endif
 		/*
 		 * Replace recent_used_cpu with prev as it is a potential
 		 * candidate for the next wake:
@@ -6506,7 +6541,12 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 		base_energy += base_energy_pd;
 
 		for_each_cpu_and(cpu, perf_domain_span(pd), sched_domain_span(sd)) {
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+			if (!(cpumask_test_cpu(cpu, p->cpus_ptr) ||
+			      cpumask_affinity_boost(cpu, p)))
+#else
 			if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+#endif
 				continue;
 
 			/* Skip CPUs that will be overutilized. */
@@ -6596,7 +6636,12 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 		}
 
 		want_affine = !wake_wide(p) && !wake_cap(p, cpu, prev_cpu) &&
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+			      (cpumask_test_cpu(cpu, p->cpus_ptr) ||
+			       cpumask_affinity_boost(cpu, p));
+#else
 			      cpumask_test_cpu(cpu, p->cpus_ptr);
+#endif
 	}
 
 	rcu_read_lock();
@@ -7374,7 +7419,12 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	if (kthread_is_per_cpu(p))
 		return 0;
 
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+	if (!(cpumask_test_cpu(env->dst_cpu, p->cpus_ptr) ||
+	      cpumask_affinity_boost(env->dst_cpu, p))) {
+#else
 	if (!cpumask_test_cpu(env->dst_cpu, p->cpus_ptr)) {
+#endif
 		int cpu;
 
 		schedstat_inc(p->se.statistics.nr_failed_migrations_affine);
@@ -7394,7 +7444,12 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 
 		/* Prevent to re-select dst_cpu via env's CPUs: */
 		for_each_cpu_and(cpu, env->dst_grpmask, env->cpus) {
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+			if (cpumask_test_cpu(cpu, p->cpus_ptr) ||
+			    cpumask_affinity_boost(cpu, p)) {
+#else
 			if (cpumask_test_cpu(cpu, p->cpus_ptr)) {
+#endif
 				env->flags |= LBF_DST_PINNED;
 				env->new_dst_cpu = cpu;
 				break;
@@ -9132,7 +9187,12 @@ more_balance:
 			 * if the curr task on busiest CPU can't be
 			 * moved to this_cpu:
 			 */
+#ifdef CONFIG_CFS_BANDWIDTH_BOOST
+			if (!(cpumask_test_cpu(this_cpu, busiest->curr->cpus_ptr) ||
+			      cpumask_affinity_boost(this_cpu, busiest->curr))) {
+#else
 			if (!cpumask_test_cpu(this_cpu, busiest->curr->cpus_ptr)) {
+#endif
 				raw_spin_unlock_irqrestore(&busiest->lock,
 							    flags);
 				env.flags |= LBF_ALL_PINNED;
